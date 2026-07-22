@@ -2,7 +2,7 @@
 
 This project contains a project-local pi extension at `.pi/extensions/prompt-refiner.ts`.
 
-While typing a prompt, press **Ctrl+Enter** to ask the selected pi model to rewrite it. The overlay shows the original and refined prompt:
+While typing a prompt, press **Ctrl+Enter** to ask the selected pi model to rewrite it. The overlay shows an animated refinement indicator, elapsed time, streamed character progress, and a live preview while it works. Once complete, it shows the original and refined prompt:
 
 - **Accept** replaces the editor text with the refined prompt.
 - **Decline**, **Esc**, or **Ctrl+C** closes the overlay without changing the editor.

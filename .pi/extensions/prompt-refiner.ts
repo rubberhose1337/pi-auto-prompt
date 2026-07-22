@@ -1,4 +1,4 @@
-import { complete, type UserMessage } from "@earendil-works/pi-ai/compat";
+import { stream, type UserMessage } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, type Component, type TUI, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
@@ -15,13 +15,18 @@ type PromptRefinementResult = {
 
 type OverlayState = "refining" | "review" | "error";
 
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 type Model = NonNullable<ExtensionContext["model"]>;
+
+type RefinementProgress = (partialText: string) => void;
 
 async function refinePrompt(
 	prompt: string,
 	model: Model,
 	ctx: ExtensionContext,
 	signal: AbortSignal,
+	onProgress: RefinementProgress,
 ): Promise<string> {
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 	if (!auth.ok || !auth.apiKey) {
@@ -39,7 +44,7 @@ async function refinePrompt(
 		timestamp: Date.now(),
 	};
 
-	const response = await complete(
+	const responseStream = stream(
 		model,
 		{
 			systemPrompt: REFINEMENT_SYSTEM_PROMPT,
@@ -55,8 +60,20 @@ async function refinePrompt(
 		},
 	);
 
+	let streamedText = "";
+	for await (const event of responseStream) {
+		if (event.type === "text_delta") {
+			streamedText += event.delta;
+			onProgress(streamedText);
+		}
+	}
+
+	const response = await responseStream.result();
 	if (response.stopReason === "aborted") {
 		throw new Error("Refinement was cancelled");
+	}
+	if (response.stopReason === "error") {
+		throw new Error(response.errorMessage ?? "The model failed while refining the prompt");
 	}
 
 	const refined = response.content
@@ -66,7 +83,7 @@ async function refinePrompt(
 		.trim();
 
 	if (!refined) {
-		throw new Error(response.errorMessage ?? "The model returned an empty refined prompt");
+		throw new Error("The model returned an empty refined prompt");
 	}
 
 	return refined;
@@ -75,8 +92,12 @@ async function refinePrompt(
 class PromptRefinementOverlay implements Component {
 	private state: OverlayState = "refining";
 	private refinedPrompt = "";
+	private streamedPreview = "";
 	private errorMessage = "";
 	private selectedOption = 0;
+	private spinnerFrame = 0;
+	private spinnerTimer: ReturnType<typeof setInterval> | undefined;
+	private readonly startedAt = Date.now();
 	private closed = false;
 	private readonly abortController = new AbortController();
 
@@ -85,23 +106,41 @@ class PromptRefinementOverlay implements Component {
 		private readonly theme: Theme,
 		private readonly originalPrompt: string,
 		private readonly modelName: string,
-		private readonly refine: (signal: AbortSignal) => Promise<string>,
+		private readonly refine: (signal: AbortSignal, onProgress: RefinementProgress) => Promise<string>,
 		private readonly done: (result: PromptRefinementResult | null) => void,
 	) {
+		this.spinnerTimer = setInterval(() => {
+			if (this.closed || this.state !== "refining") return;
+			this.spinnerFrame = (this.spinnerFrame + 1) % SPINNER_FRAMES.length;
+			this.tui.requestRender();
+		}, 120);
 		void this.startRefinement();
+	}
+
+	private stopSpinner(): void {
+		if (this.spinnerTimer !== undefined) {
+			clearInterval(this.spinnerTimer);
+			this.spinnerTimer = undefined;
+		}
 	}
 
 	private async startRefinement(): Promise<void> {
 		try {
-			const refined = await this.refine(this.abortController.signal);
+			const refined = await this.refine(this.abortController.signal, (partialText) => {
+				if (this.closed || this.abortController.signal.aborted) return;
+				this.streamedPreview = partialText;
+				this.tui.requestRender();
+			});
 			if (this.closed || this.abortController.signal.aborted) return;
 
+			this.stopSpinner();
 			this.refinedPrompt = refined;
 			this.state = "review";
 			this.tui.requestRender();
 		} catch (error) {
 			if (this.closed || this.abortController.signal.aborted) return;
 
+			this.stopSpinner();
 			this.errorMessage = error instanceof Error ? error.message : String(error);
 			this.state = "error";
 			this.tui.requestRender();
@@ -155,6 +194,7 @@ class PromptRefinementOverlay implements Component {
 	private close(accepted: boolean): void {
 		if (this.closed) return;
 		this.closed = true;
+		this.stopSpinner();
 		this.abortController.abort();
 
 		this.done(
@@ -218,7 +258,18 @@ class PromptRefinementOverlay implements Component {
 		divider();
 
 		if (this.state === "refining") {
-			addWrapped(`Refining your prompt with ${this.modelName}…`, "muted");
+			const spinner = SPINNER_FRAMES[this.spinnerFrame] ?? "•";
+			const elapsedSeconds = Math.floor((Date.now() - this.startedAt) / 1000);
+			addWrapped(`${spinner} REFINING PROMPT with ${this.modelName}…`, "accent");
+			addWrapped(
+				`${elapsedSeconds}s elapsed • ${this.streamedPreview.length} characters received`,
+				"muted",
+			);
+			if (this.streamedPreview) {
+				row("");
+				addWrapped("Live refinement preview:", "accent");
+				addWrapped(this.streamedPreview, "text", Math.max(1, previewLines));
+			}
 			row("");
 			addWrapped("Press Esc to cancel.", "dim");
 		} else if (this.state === "error") {
@@ -251,6 +302,7 @@ class PromptRefinementOverlay implements Component {
 
 	dispose(): void {
 		this.closed = true;
+		this.stopSpinner();
 		this.abortController.abort();
 	}
 }
@@ -289,7 +341,7 @@ export default function promptRefiner(pi: ExtensionAPI): void {
 							theme,
 							originalPrompt,
 							model.id,
-							(signal) => refinePrompt(originalPrompt, model, ctx, signal),
+							(signal, onProgress) => refinePrompt(originalPrompt, model, ctx, signal, onProgress),
 							done,
 						),
 					{
