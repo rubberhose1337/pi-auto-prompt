@@ -17,6 +17,75 @@ type OverlayState = "refining" | "review" | "error";
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+function skipCsiSequence(text: string, start: number, prefixLength: number): number {
+	for (let index = start + prefixLength; index < text.length; index++) {
+		const code = text.charCodeAt(index);
+		if (code >= 0x40 && code <= 0x7e) return index + 1;
+	}
+	return text.length;
+}
+
+function skipStringSequence(text: string, start: number, prefixLength: number): number {
+	for (let index = start + prefixLength; index < text.length; index++) {
+		const code = text.charCodeAt(index);
+		if (code === 0x07 || code === 0x9c) return index + 1; // BEL or ST
+		if (code === 0x1b && text.charCodeAt(index + 1) === 0x5c) return index + 2; // ESC \\
+	}
+	return text.length;
+}
+
+function skipTerminalSequence(text: string, start: number): number {
+	const code = text.charCodeAt(start);
+	const next = text.charCodeAt(start + 1);
+
+	if (code === 0x1b && next === 0x5b) return skipCsiSequence(text, start, 2); // ESC [
+	if (code === 0x9b) return skipCsiSequence(text, start, 1); // CSI
+
+	if (
+		(code === 0x1b && [0x50, 0x58, 0x5d, 0x5e, 0x5f].includes(next)) ||
+		[0x90, 0x98, 0x9d, 0x9e, 0x9f].includes(code)
+	) {
+		return skipStringSequence(text, start, code === 0x1b ? 2 : 1);
+	}
+
+	// Remove the introducer and one-byte escape target for any other ESC sequence.
+	return Math.min(text.length, start + (code === 0x1b ? 2 : 1));
+}
+
+function sanitizeTerminalText(text: string): string {
+	let sanitized = "";
+
+	for (let index = 0; index < text.length;) {
+		const code = text.charCodeAt(index);
+
+		if (
+			code === 0x1b ||
+			code === 0x9b ||
+			code === 0x90 ||
+			code === 0x98 ||
+			code === 0x9d ||
+			code === 0x9e ||
+			code === 0x9f
+		) {
+			index = skipTerminalSequence(text, index);
+			continue;
+		}
+
+		if (code === 0x0a) {
+			sanitized += "\n";
+		} else if (code === 0x09) {
+			// Tabs can move the terminal cursor unpredictably; display them as spaces.
+			sanitized += " ";
+		} else if (code >= 0x20 && code !== 0x7f && !(code >= 0x80 && code <= 0x9f)) {
+			sanitized += text[index];
+		}
+
+		index++;
+	}
+
+	return sanitized;
+}
+
 type Model = NonNullable<ExtensionContext["model"]>;
 
 type RefinementProgress = (partialText: string) => void;
@@ -228,7 +297,8 @@ class PromptRefinementOverlay implements Component {
 			maxLines?: number,
 		) => {
 			const contentWidth = Math.max(1, innerWidth - 2);
-			const wrapped = wrapTextWithAnsi(this.theme.fg(color, text), contentWidth);
+			const safeText = sanitizeTerminalText(text);
+			const wrapped = wrapTextWithAnsi(this.theme.fg(color, safeText), contentWidth);
 			const visibleLines = maxLines === undefined ? wrapped : wrapped.slice(0, Math.max(0, maxLines - 1));
 			for (const line of visibleLines) row(` ${line}`);
 			if (maxLines !== undefined && wrapped.length > maxLines && maxLines > 0) {

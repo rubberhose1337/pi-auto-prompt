@@ -1,0 +1,15 @@
+{
+  "name": "pi-auto-prompt",
+  "version": "0.1.0",
+  "description": "Prompt refinement extension for Pi",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./.pi/extensions/prompt-refiner.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
